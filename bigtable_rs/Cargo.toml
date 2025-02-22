@@ -29,6 +29,7 @@ futures-util = "0.3.31"
 gcp_auth = "0.12.2"
 log = "0.4.20"
 thiserror = "2.0.3"
+debug-ignore = "1.0.5"
 
 [dev-dependencies]
 env_logger = "0.11.1"

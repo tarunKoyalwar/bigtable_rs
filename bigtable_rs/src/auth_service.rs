@@ -54,7 +54,7 @@ impl Service<Request<BoxBody>> for AuthSvc {
             let scopes = &[scopes.as_ref()];
             let token_f_opt = token_provider.as_ref().map(|m| m.token(scopes));
 
-            return match token_f_opt {
+            match token_f_opt {
                 None => {
                     debug!("auth intercepting and not attaching token");
                     let response = inner.call(request).await?;
@@ -75,7 +75,7 @@ impl Service<Request<BoxBody>> for AuthSvc {
                     let response = inner.call(request).await?;
                     Ok(response)
                 }
-            };
+            }
         })
     }
 }

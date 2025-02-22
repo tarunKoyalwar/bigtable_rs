@@ -223,5 +223,5 @@ pub fn decode_read_rows_response_to_vec(
         return rows;
     }
 
-    return rows;
+    rows
 }
