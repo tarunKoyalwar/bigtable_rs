@@ -29,6 +29,15 @@ Google's Java client
 with [json test cases](https://github.com/googleapis/conformance-tests/blob/main/bigtable/v2/readrows.json) as raw
 input.
 
+>[!NOTE]
+> ## Disclaimer
+>
+> This is fork of [bigtable_rs](https://github.com/liufuyang/bigtable_rs) with some changes to make it more stable and added some missing defaults
+> - Set Message Encoding/Decoding size to 64MB (as per python sdk)
+> - Set Concurrency limit to 100 per grpc connection (bigtable docs)
+> - Expose more network related configs via `Config` struct and `from_config` factory method
+> - Some documentation/examples
+
 ## Introduction
 
 Current idea is to make this library very light weighted, and you assemble requests based
