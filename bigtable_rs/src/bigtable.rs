@@ -86,12 +86,12 @@
 //! }
 //! ```
 
-use std::sync::Arc;
-use std::time::Duration;
-
+use debug_ignore::DebugIgnore;
 use futures_util::Stream;
 use gcp_auth::TokenProvider;
 use log::info;
+use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::net::UnixStream;
 use tonic::transport::Endpoint;
@@ -115,6 +115,24 @@ type RowKey = Vec<u8>;
 type Result<T> = std::result::Result<T, Error>;
 
 /// A data structure for returning the read content of a cell in a row.
+///
+/// Each cell in a Bigtable row contains:
+/// - A family name (column family)
+/// - A qualifier (column name)
+/// - The actual value
+/// - A timestamp in microseconds
+/// - Optional labels
+///
+/// # Example
+/// ```ignore
+/// let cell = RowCell {
+///     family_name: "cf1".to_string(),
+///     qualifier: "col1".as_bytes().to_vec(),
+///     value: "value1".as_bytes().to_vec(),
+///     timestamp_micros: 1234567890,
+///     labels: vec!["label1".to_string()],
+/// };
+/// ```
 #[derive(Debug)]
 pub struct RowCell {
     pub family_name: String,
@@ -124,7 +142,59 @@ pub struct RowCell {
     pub labels: Vec<String>,
 }
 
-/// Error types the client may have
+/// Configuration for establishing a BigTable connection.
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub concurrency_limit: usize,
+    pub timeout: Option<Duration>,
+    pub max_grpc_connections: usize,
+    pub token_provider: Option<DebugIgnore<Arc<dyn TokenProvider>>>,
+    pub endpoint_cb: Option<fn(Endpoint) -> Endpoint>,
+    pub tonic_cb: Option<
+        fn(
+            ServiceBuilder<tower::layer::util::Identity>,
+        ) -> ServiceBuilder<tower::layer::util::Identity>,
+    >,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            concurrency_limit: 100,
+            timeout: None,
+            max_grpc_connections: 1,
+            token_provider: None,
+            endpoint_cb: None,
+            tonic_cb: None,
+        }
+    }
+}
+
+/// Error types that may occur during Bigtable operations.
+///
+/// This enum covers various error scenarios including:
+/// - Authentication and access token errors
+/// - Transport and RPC errors
+/// - Row operation failures
+/// - Timeout errors
+///
+/// # Example
+/// ```ignore
+/// match bigtable.read_rows(request).await {
+///     Ok(rows) => {
+///         // Process rows
+///     }
+///     Err(Error::TimeoutError(duration)) => {
+///         println!("Operation timed out after {} seconds", duration);
+///     }
+///     Err(Error::RowNotFound) => {
+///         println!("The requested row was not found");
+///     }
+///     Err(e) => {
+///         println!("An error occurred: {}", e);
+///     }
+/// }
+/// ```
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("AccessToken error: {0}")]
@@ -236,6 +306,7 @@ impl BigTableConnection {
                     timeout,
                     token_provider,
                 )
+                .await
             }
         }
     }
@@ -257,7 +328,7 @@ impl BigTableConnection {
     /// https://docs.rs/tokio/latest/tokio/attr.main.html, but it might be a very different case for
     /// different applications.
     ///
-    pub fn new_with_token_provider(
+    pub async fn new_with_token_provider(
         project_id: &str,
         instance_name: &str,
         is_read_only: bool,
@@ -265,13 +336,31 @@ impl BigTableConnection {
         timeout: Option<Duration>,
         token_provider: Arc<dyn TokenProvider>,
     ) -> Result<Self> {
+        let config = Config {
+            concurrency_limit: 100,
+            timeout,
+            max_grpc_connections: channel_size,
+            token_provider: Some(DebugIgnore(token_provider)),
+            endpoint_cb: None,
+            tonic_cb: None,
+        };
+
+        Self::from_config(project_id, instance_name, is_read_only, config).await
+    }
+
+    pub async fn from_config(
+        project_id: &str,
+        instance_name: &str,
+        is_read_only: bool,
+        config: Config,
+    ) -> Result<Self> {
         match std::env::var("BIGTABLE_EMULATOR_HOST") {
             Ok(endpoint) => Self::new_with_emulator(
                 endpoint.as_str(),
                 project_id,
                 instance_name,
                 is_read_only,
-                timeout,
+                config.timeout,
             ),
 
             Err(_) => {
@@ -280,10 +369,11 @@ impl BigTableConnection {
                     project_id, instance_name
                 );
 
-                let endpoints: Result<Vec<Endpoint>> = vec![0; channel_size.max(1)]
+                let endpoints: Result<Vec<Endpoint>> = vec![0; config.max_grpc_connections.max(1)]
                     .iter()
                     .map(move |_| {
                         Channel::from_static("https://bigtable.googleapis.com")
+                            .concurrency_limit(config.concurrency_limit)
                             .tls_config(
                                 ClientTlsConfig::new()
                                     .ca_certificate(
@@ -304,8 +394,16 @@ impl BigTableConnection {
                             .keep_alive_while_idle(true)
                     })
                     .map(|ep| {
-                        if let Some(timeout) = timeout {
+                        if let Some(timeout) = config.timeout {
                             ep.timeout(timeout)
+                        } else {
+                            ep
+                        }
+                    })
+                    .map(|ep| {
+                        // allow customizing the endpoint
+                        if let Some(cb) = config.endpoint_cb {
+                            cb(ep)
                         } else {
                             ep
                         }
@@ -314,12 +412,18 @@ impl BigTableConnection {
 
                 // construct a channel, by balancing over all endpoints.
                 let channel = Channel::balance_list(endpoints.into_iter());
-
-                let token_provider = Some(token_provider);
+                // Unwrap the DebugIgnore wrapper to get the Arc<dyn TokenProvider>
+                let mut token_provider = match config.token_provider {
+                    Some(wrapped_provider) => Some(wrapped_provider.0),
+                    None => None,
+                };
+                if token_provider.is_none() {
+                    token_provider = Some(gcp_auth::provider().await?);
+                }
                 Ok(Self {
-                    client: create_client(channel, token_provider, is_read_only),
+                    client: create_client(channel, token_provider, is_read_only, config.tonic_cb),
                     table_prefix: Arc::new(table_prefix),
-                    timeout: Arc::new(timeout),
+                    timeout: Arc::new(config.timeout),
                 })
             }
         }
@@ -382,7 +486,7 @@ impl BigTableConnection {
         };
 
         Ok(Self {
-            client: create_client(channel, None, is_read_only),
+            client: create_client(channel, None, is_read_only, None),
             table_prefix: Arc::new(format!(
                 "projects/{}/instances/{}/tables/",
                 project_id, instance_name
@@ -418,17 +522,31 @@ fn create_client(
     channel: Channel,
     token_provider: Option<Arc<dyn TokenProvider>>,
     read_only: bool,
+    cb: Option<
+        fn(
+            ServiceBuilder<tower::layer::util::Identity>,
+        ) -> ServiceBuilder<tower::layer::util::Identity>,
+    >,
 ) -> BigtableClient<AuthSvc> {
     let scopes = if read_only {
         "https://www.googleapis.com/auth/bigtable.data.readonly"
     } else {
         "https://www.googleapis.com/auth/bigtable.data"
     };
-
-    let auth_svc = ServiceBuilder::new()
+    let mut builder = ServiceBuilder::new();
+    // Apply the callback first if it exists
+    if let Some(cb) = cb {
+        builder = cb(builder);
+    }
+    // Then add the auth layer
+    let auth_svc = builder
         .layer_fn(|c| AuthSvc::new(c, token_provider.clone(), scopes.to_string()))
         .service(channel);
-    return BigtableClient::new(auth_svc);
+
+    // Create client with custom codec config
+    BigtableClient::new(auth_svc)
+        .max_decoding_message_size(64 * 1024 * 1024) // 64MB
+        .max_encoding_message_size(64 * 1024 * 1024) // 64MB
 }
 
 /// The core struct for Bigtable client, which wraps a gPRC client defined by Bigtable proto.
@@ -457,7 +575,25 @@ pub struct BigTable {
 }
 
 impl BigTable {
-    /// Wrapped `check_and_mutate_row` method
+    /// Performs a conditional mutation on a row.
+    ///
+    /// This method atomically checks a condition on a row and mutates it if the condition is true.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use bigtable_rs::google::bigtable::v2::{CheckAndMutateRowRequest, Mutation};
+    ///
+    /// let request = CheckAndMutateRowRequest {
+    ///     table_name: bigtable.get_full_table_name("table-1"),
+    ///     predicate_filter: Some(/* row filter */),
+    ///     true_mutations: vec![/* mutations if condition is true */],
+    ///     false_mutations: vec![/* mutations if condition is false */],
+    ///     ..Default::default()
+    /// };
+    ///
+    /// let response = bigtable.check_and_mutate_row(request).await?;
+    /// println!("Predicate matched: {}", response.predicate_matched);
+    /// ```
     pub async fn check_and_mutate_row(
         &mut self,
         request: CheckAndMutateRowRequest,
@@ -470,16 +606,34 @@ impl BigTable {
         Ok(response)
     }
 
-    /// Wrapped `read_rows` method
-    pub async fn read_rows(
-        &mut self,
-        request: ReadRowsRequest,
-    ) -> Result<Vec<(RowKey, Vec<RowCell>)>> {
-        let response = self.client.read_rows(request).await?.into_inner();
-        decode_read_rows_response(self.timeout.as_ref(), response).await
-    }
-
-    /// Provide `read_rows_with_prefix` method to allow using a prefix as key
+    /// Reads rows from a table using a prefix-based row range.
+    ///
+    /// This is a convenience method that constructs a row range from a prefix and reads all rows
+    /// that start with that prefix.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use bigtable_rs::google::bigtable::v2::ReadRowsRequest;
+    ///
+    /// let request = ReadRowsRequest {
+    ///     table_name: bigtable.get_full_table_name("table-1"),
+    ///     ..Default::default()
+    /// };
+    ///
+    /// let prefix = "user_".as_bytes().to_vec();
+    /// let rows = bigtable.read_rows_with_prefix(request, prefix).await?;
+    ///
+    /// for (key, cells) in rows {
+    ///     println!("Row key: {}", String::from_utf8_lossy(&key));
+    ///     for cell in cells {
+    ///         println!("  {} : {} = {}",
+    ///             cell.family_name,
+    ///             String::from_utf8_lossy(&cell.qualifier),
+    ///             String::from_utf8_lossy(&cell.value)
+    ///         );
+    ///     }
+    /// }
+    /// ```
     pub async fn read_rows_with_prefix(
         &mut self,
         mut request: ReadRowsRequest,
@@ -494,7 +648,36 @@ impl BigTable {
         decode_read_rows_response(self.timeout.as_ref(), response).await
     }
 
-    /// Streaming support for `read_rows` method
+    /// Streams rows from a table, returning them as they are received.
+    ///
+    /// This method is useful when dealing with large result sets as it allows processing
+    /// rows as they arrive rather than waiting for all rows to be received.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use futures_util::StreamExt;
+    /// use bigtable_rs::google::bigtable::v2::ReadRowsRequest;
+    ///
+    /// let request = ReadRowsRequest {
+    ///     table_name: bigtable.get_full_table_name("table-1"),
+    ///     rows_limit: 1000,
+    ///     ..Default::default()
+    /// };
+    ///
+    /// let mut stream = bigtable.stream_rows(request).await?;
+    ///
+    /// while let Some(result) = stream.next().await {
+    ///     match result {
+    ///         Ok((key, cells)) => {
+    ///             println!("Received row: {}", String::from_utf8_lossy(&key));
+    ///             for cell in cells {
+    ///                 println!("  Data: {}", String::from_utf8_lossy(&cell.value));
+    ///             }
+    ///         }
+    ///         Err(e) => println!("Error processing row: {}", e),
+    ///     }
+    /// }
+    /// ```
     pub async fn stream_rows(
         &mut self,
         request: ReadRowsRequest,
@@ -504,7 +687,40 @@ impl BigTable {
         Ok(stream)
     }
 
-    /// Streaming support for `read_rows_with_prefix` method
+    /// Streams rows from a table using a prefix-based row range.
+    ///
+    /// This combines the functionality of `stream_rows` and `read_rows_with_prefix`,
+    /// allowing streaming access to rows matching a prefix.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use futures_util::StreamExt;
+    /// use bigtable_rs::google::bigtable::v2::ReadRowsRequest;
+    ///
+    /// let request = ReadRowsRequest {
+    ///     table_name: bigtable.get_full_table_name("table-1"),
+    ///     ..Default::default()
+    /// };
+    ///
+    /// let prefix = "user_".as_bytes().to_vec();
+    /// let mut stream = bigtable.stream_rows_with_prefix(request, prefix).await?;
+    ///
+    /// while let Some(result) = stream.next().await {
+    ///     match result {
+    ///         Ok((key, cells)) => {
+    ///             println!("Received row: {}", String::from_utf8_lossy(&key));
+    ///             for cell in cells {
+    ///                 println!("  {} : {} = {}",
+    ///                     cell.family_name,
+    ///                     String::from_utf8_lossy(&cell.qualifier),
+    ///                     String::from_utf8_lossy(&cell.value)
+    ///                 );
+    ///             }
+    ///         }
+    ///         Err(e) => println!("Error processing row: {}", e),
+    ///     }
+    /// }
+    /// ```
     pub async fn stream_rows_with_prefix(
         &mut self,
         mut request: ReadRowsRequest,
@@ -520,7 +736,33 @@ impl BigTable {
         Ok(stream)
     }
 
-    /// Wrapped `sample_row_keys` method
+    /// Returns a set of sample row keys in the table.
+    ///
+    /// This method is useful for:
+    /// - Determining table size and row distribution
+    /// - Planning parallel reads
+    /// - Choosing row key ranges for batch operations
+    ///
+    /// # Example
+    /// ```ignore
+    /// use futures_util::StreamExt;
+    /// use bigtable_rs::google::bigtable::v2::SampleRowKeysRequest;
+    ///
+    /// let request = SampleRowKeysRequest {
+    ///     table_name: bigtable.get_full_table_name("table-1"),
+    ///     ..Default::default()
+    /// };
+    ///
+    /// let mut stream = bigtable.sample_row_keys(request).await?;
+    ///
+    /// while let Some(response) = stream.message().await? {
+    ///     println!(
+    ///         "Row key: {}, Offset: {}",
+    ///         String::from_utf8_lossy(&response.row_key),
+    ///         response.offset_bytes
+    ///     );
+    /// }
+    /// ```
     pub async fn sample_row_keys(
         &mut self,
         request: SampleRowKeysRequest,
@@ -529,7 +771,33 @@ impl BigTable {
         Ok(response)
     }
 
-    /// Wrapped `mutate_row` method
+    /// Mutates a single row atomically.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use bigtable_rs::google::bigtable::v2::{MutateRowRequest, Mutation};
+    /// use bigtable_rs::google::bigtable::v2::mutation::SetCell;
+    ///
+    /// let mutation = Mutation {
+    ///     mutation: Some(bigtable_rs::google::bigtable::v2::mutation::Mutation::SetCell(
+    ///         SetCell {
+    ///             family_name: "cf1".to_string(),
+    ///             column_qualifier: "col1".as_bytes().to_vec(),
+    ///             timestamp_micros: -1, // Server-assigned timestamp
+    ///             value: "new_value".as_bytes().to_vec(),
+    ///         }
+    ///     )),
+    /// };
+    ///
+    /// let request = MutateRowRequest {
+    ///     table_name: bigtable.get_full_table_name("table-1"),
+    ///     row_key: "key1".as_bytes().to_vec(),
+    ///     mutations: vec![mutation],
+    ///     ..Default::default()
+    /// };
+    ///
+    /// let response = bigtable.mutate_row(request).await?;
+    /// ```
     pub async fn mutate_row(
         &mut self,
         request: MutateRowRequest,
@@ -538,7 +806,55 @@ impl BigTable {
         Ok(response)
     }
 
-    /// Wrapped `mutate_rows` method
+    /// Mutates multiple rows in a single request.
+    ///
+    /// This method is more efficient than calling `mutate_row` multiple times
+    /// when you need to modify multiple rows.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use bigtable_rs::google::bigtable::v2::{MutateRowsRequest, Mutation};
+    /// use bigtable_rs::google::bigtable::v2::mutation::SetCell;
+    ///
+    /// let mutation = Mutation {
+    ///     mutation: Some(bigtable_rs::google::bigtable::v2::mutation::Mutation::SetCell(
+    ///         SetCell {
+    ///             family_name: "cf1".to_string(),
+    ///             column_qualifier: "col1".as_bytes().to_vec(),
+    ///             timestamp_micros: -1,
+    ///             value: "new_value".as_bytes().to_vec(),
+    ///         }
+    ///     )),
+    /// };
+    ///
+    /// let entries = vec![
+    ///     bigtable_rs::google::bigtable::v2::mutate_rows_request::Entry {
+    ///         row_key: "key1".as_bytes().to_vec(),
+    ///         mutations: vec![mutation.clone()],
+    ///     },
+    ///     bigtable_rs::google::bigtable::v2::mutate_rows_request::Entry {
+    ///         row_key: "key2".as_bytes().to_vec(),
+    ///         mutations: vec![mutation],
+    ///     },
+    /// ];
+    ///
+    /// let request = MutateRowsRequest {
+    ///     table_name: bigtable.get_full_table_name("table-1"),
+    ///     entries,
+    ///     ..Default::default()
+    /// };
+    ///
+    /// let mut stream = bigtable.mutate_rows(request).await?;
+    /// while let Some(response) = stream.message().await? {
+    ///     for entry in response.entries {
+    ///         println!(
+    ///             "Row {} mutation status: {:?}",
+    ///             entry.index,
+    ///             entry.status
+    ///         );
+    ///     }
+    /// }
+    /// ```
     pub async fn mutate_rows(
         &mut self,
         request: MutateRowsRequest,
@@ -564,5 +880,50 @@ impl BigTable {
     /// Provide a convenient method to get full table, which can be used for building requests
     pub fn get_full_table_name(&self, table_name: &str) -> String {
         [&self.table_prefix, table_name].concat()
+    }
+
+    /// Reads rows from a table.
+    ///
+    /// This method allows reading multiple rows from a table using various filters and row ranges.
+    /// For reading rows with a specific prefix, see `read_rows_with_prefix`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use bigtable_rs::google::bigtable::v2::{ReadRowsRequest, RowSet, RowRange};
+    /// use bigtable_rs::google::bigtable::v2::row_range::{StartKey, EndKey};
+    ///
+    /// let request = ReadRowsRequest {
+    ///     table_name: bigtable.get_full_table_name("table-1"),
+    ///     rows: Some(RowSet {
+    ///         row_keys: vec!["specific_key".as_bytes().to_vec()],
+    ///         row_ranges: vec![RowRange {
+    ///             start_key: Some(StartKey::StartKeyClosed("start".as_bytes().to_vec())),
+    ///             end_key: Some(EndKey::EndKeyOpen("end".as_bytes().to_vec())),
+    ///         }],
+    ///     }),
+    ///     rows_limit: 1000,
+    ///     ..Default::default()
+    /// };
+    ///
+    /// let rows = bigtable.read_rows(request).await?;
+    ///
+    /// for (key, cells) in rows {
+    ///     println!("Row key: {}", String::from_utf8_lossy(&key));
+    ///     for cell in cells {
+    ///         println!("  {} : {} = {} @ {}",
+    ///             cell.family_name,
+    ///             String::from_utf8_lossy(&cell.qualifier),
+    ///             String::from_utf8_lossy(&cell.value),
+    ///             cell.timestamp_micros
+    ///         );
+    ///     }
+    /// }
+    /// ```
+    pub async fn read_rows(
+        &mut self,
+        request: ReadRowsRequest,
+    ) -> Result<Vec<(RowKey, Vec<RowCell>)>> {
+        let response = self.client.read_rows(request).await?.into_inner();
+        decode_read_rows_response(self.timeout.as_ref(), response).await
     }
 }
