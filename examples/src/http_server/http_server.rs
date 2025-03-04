@@ -7,7 +7,7 @@ use warp::http::StatusCode;
 use warp::reply::with_status;
 use warp::{Filter as WarpFilter, Rejection, Reply};
 
-use bigtable_rs::bigtable::{BigTable, BigTableConnection};
+use bigtable_rs::bigtable::{BigTable, BigTableConnection,ClientType};
 use bigtable_rs::google::bigtable::v2::mutation::SetCell;
 use bigtable_rs::google::bigtable::v2::row_filter::Chain;
 use bigtable_rs::google::bigtable::v2::row_filter::Filter;
@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // make a bigtable client
     let connection: BigTableConnection =
-        BigTableConnection::new(PROJECT_ID, INSTANCE_NAME, true, channel_size, Some(timeout))
+        BigTableConnection::new(PROJECT_ID, INSTANCE_NAME, Some(ClientType::ReadWrite), channel_size, Some(timeout))
             .await?;
     let bigtable = connection.client();
 
