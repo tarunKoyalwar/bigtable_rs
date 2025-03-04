@@ -552,7 +552,7 @@ fn create_client(
     let scopes = match client_type {
         ClientType::ReadOnly => "https://www.googleapis.com/auth/bigtable.data.readonly",
         ClientType::ReadWrite => "https://www.googleapis.com/auth/bigtable.data",
-        ClientType::Admin => "https://www.googleapis.com/auth/bigtable.admin.table",
+        ClientType::Admin => "https://www.googleapis.com/auth/bigtable.admin",
     };
     let mut builder = ServiceBuilder::new();
     // Apply the callback first if it exists
