@@ -109,6 +109,25 @@ use crate::{root_ca_certificate, util::get_row_range_from_prefix};
 
 pub mod read_rows;
 
+
+/// The type of client to be used
+/// 
+/// - ReadOnly: for read-only access
+/// - ReadWrite: for read-write access (default)
+/// - Admin: for admin access
+#[derive(Debug, Clone)]
+pub enum ClientType {
+    ReadOnly,
+    ReadWrite,
+    Admin,
+}
+
+impl Default for ClientType {
+    fn default() -> Self {
+        Self::ReadWrite
+    }
+}
+
 /// An alias for Vec<u8> as row key
 type RowKey = Vec<u8>;
 /// A convenient Result type
@@ -261,8 +280,9 @@ pub struct BigTableConnection {
 }
 
 impl BigTableConnection {
-    /// Establish a connection to the BigTable instance named `instance_name`.  If read-only access
-    /// is required, the `read_only` flag should be used to reduce the requested OAuth2 scope.
+    /// Establish a connection to the BigTable instance named `instance_name`. By default,
+    /// read-write access is provided. Use the `client_type` parameter to specify different
+    /// access levels (ReadOnly, ReadWrite, or Admin).
     ///
     /// The GOOGLE_APPLICATION_CREDENTIALS environment variable will be used to determine the
     /// program name that contains the BigTable instance in addition to access credentials.
@@ -283,7 +303,7 @@ impl BigTableConnection {
     pub async fn new(
         project_id: &str,
         instance_name: &str,
-        is_read_only: bool,
+        client_type: Option<ClientType>,
         channel_size: usize,
         timeout: Option<Duration>,
     ) -> Result<Self> {
@@ -292,7 +312,7 @@ impl BigTableConnection {
                 endpoint.as_str(),
                 project_id,
                 instance_name,
-                is_read_only,
+                client_type.unwrap_or_default(),
                 timeout,
             ),
 
@@ -301,7 +321,7 @@ impl BigTableConnection {
                 Self::new_with_token_provider(
                     project_id,
                     instance_name,
-                    is_read_only,
+                    client_type.unwrap_or_default(),
                     channel_size,
                     timeout,
                     token_provider,
@@ -310,12 +330,13 @@ impl BigTableConnection {
             }
         }
     }
-    /// Establish a connection to the BigTable instance named `instance_name`.  If read-only access
-    /// is required, the `read_only` flag should be used to reduce the requested OAuth2 scope.
+
+    /// Establish a connection to the BigTable instance named `instance_name`. By default,
+    /// read-write access is provided. Use the `client_type` parameter to specify different
+    /// access levels (ReadOnly, ReadWrite, or Admin).
     ///
     /// The `authentication_manager` variable will be used to determine the
     /// program name that contains the BigTable instance in addition to access credentials.
-    ///
     ///
     /// `channel_size` defines the number of connections (or channels) established to Bigtable
     /// service, and the requests are load balanced onto all the channels. You must therefore
@@ -331,7 +352,7 @@ impl BigTableConnection {
     pub async fn new_with_token_provider(
         project_id: &str,
         instance_name: &str,
-        is_read_only: bool,
+        client_type: ClientType,
         channel_size: usize,
         timeout: Option<Duration>,
         token_provider: Arc<dyn TokenProvider>,
@@ -345,13 +366,13 @@ impl BigTableConnection {
             tonic_cb: None,
         };
 
-        Self::from_config(project_id, instance_name, is_read_only, config).await
+        Self::from_config(project_id, instance_name, client_type, config).await
     }
 
     pub async fn from_config(
         project_id: &str,
         instance_name: &str,
-        is_read_only: bool,
+        client_type: ClientType,
         config: Config,
     ) -> Result<Self> {
         match std::env::var("BIGTABLE_EMULATOR_HOST") {
@@ -359,7 +380,7 @@ impl BigTableConnection {
                 endpoint.as_str(),
                 project_id,
                 instance_name,
-                is_read_only,
+                client_type,
                 config.timeout,
             ),
 
@@ -421,7 +442,7 @@ impl BigTableConnection {
                     token_provider = Some(gcp_auth::provider().await?);
                 }
                 Ok(Self {
-                    client: create_client(channel, token_provider, is_read_only, config.tonic_cb),
+                    client: create_client(channel, token_provider, client_type, config.tonic_cb),
                     table_prefix: Arc::new(table_prefix),
                     timeout: Arc::new(config.timeout),
                 })
@@ -438,7 +459,7 @@ impl BigTableConnection {
         emulator_endpoint: &str,
         project_id: &str,
         instance_name: &str,
-        is_read_only: bool,
+        client_type: ClientType,
         timeout: Option<Duration>,
     ) -> Result<Self> {
         info!("Connecting to bigtable emulator at {}", emulator_endpoint);
@@ -486,7 +507,7 @@ impl BigTableConnection {
         };
 
         Ok(Self {
-            client: create_client(channel, None, is_read_only, None),
+            client: create_client(channel, None, client_type, None),
             table_prefix: Arc::new(format!(
                 "projects/{}/instances/{}/tables/",
                 project_id, instance_name
@@ -521,17 +542,17 @@ impl BigTableConnection {
 fn create_client(
     channel: Channel,
     token_provider: Option<Arc<dyn TokenProvider>>,
-    read_only: bool,
+    client_type: ClientType,
     cb: Option<
         fn(
             ServiceBuilder<tower::layer::util::Identity>,
         ) -> ServiceBuilder<tower::layer::util::Identity>,
     >,
 ) -> BigtableClient<AuthSvc> {
-    let scopes = if read_only {
-        "https://www.googleapis.com/auth/bigtable.data.readonly"
-    } else {
-        "https://www.googleapis.com/auth/bigtable.data"
+    let scopes = match client_type {
+        ClientType::ReadOnly => "https://www.googleapis.com/auth/bigtable.data.readonly",
+        ClientType::ReadWrite => "https://www.googleapis.com/auth/bigtable.data",
+        ClientType::Admin => "https://www.googleapis.com/auth/bigtable.admin.table",
     };
     let mut builder = ServiceBuilder::new();
     // Apply the callback first if it exists
