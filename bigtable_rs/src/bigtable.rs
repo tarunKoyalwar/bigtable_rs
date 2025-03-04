@@ -551,8 +551,9 @@ fn create_client(
 ) -> BigtableClient<AuthSvc> {
     let scopes = match client_type {
         ClientType::ReadOnly => "https://www.googleapis.com/auth/bigtable.data.readonly",
-        ClientType::ReadWrite => "https://www.googleapis.com/auth/bigtable.data",
-        ClientType::Admin => "https://www.googleapis.com/auth/bigtable.admin",
+        // ClientType::ReadWrite => "https://www.googleapis.com/auth/bigtable.data",
+        // ClientType::Admin => "https://www.googleapis.com/auth/bigtable.admin",
+        _ => "https://www.googleapis.com/auth/cloud-platform", // let it manage the scopes
     };
     let mut builder = ServiceBuilder::new();
     // Apply the callback first if it exists
