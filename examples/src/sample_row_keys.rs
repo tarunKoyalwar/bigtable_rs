@@ -14,11 +14,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let channel_size = 4;
     let timeout = Duration::from_secs(10);
 
-    // make a bigtable client
+    // make a bigtable client with read-only access
     let connection = bigtable::BigTableConnection::new(
         project_id,
         instance_name,
-        true,
+        Some(bigtable::ClientType::ReadOnly),
         channel_size,
         Some(timeout),
     )

@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut connection = bigtable::BigTableConnection::new_with_token_provider(
         project_id,
         instance_name,
-        false,
+        bigtable::ClientType::ReadOnly,
         channel_size,
         Some(timeout),
         Arc::new(CustomServiceAccount::from_file(json_path).unwrap()),

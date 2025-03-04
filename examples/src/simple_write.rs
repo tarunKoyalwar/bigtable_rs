@@ -21,11 +21,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let key: String = "key3".to_owned();
 
-    // make a bigtable client
+    // make a bigtable client with read-write access (this is the default, but shown explicitly here)
     let connection = bigtable::BigTableConnection::new(
         project_id,
         instance_name,
-        false,
+        Some(bigtable::ClientType::ReadWrite),
         channel_size,
         Some(timeout),
     )

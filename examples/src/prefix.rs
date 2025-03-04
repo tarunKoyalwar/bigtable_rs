@@ -17,11 +17,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let prefix: String = "k".to_owned();
 
-    // make a bigtable client
+    // make a bigtable client with read-only access
     let connection = bigtable::BigTableConnection::new(
         project_id,
         instance_name,
-        true,
+        Some(bigtable::ClientType::ReadOnly),
         channel_size,
         Some(timeout),
     )

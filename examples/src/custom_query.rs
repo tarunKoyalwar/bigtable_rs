@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let connection = bigtable::BigTableConnection::new(
         project_id,
         instance_name,
-        true,
+        Some(bigtable::ClientType::ReadOnly),
         channel_size,
         Some(timeout),
     )
